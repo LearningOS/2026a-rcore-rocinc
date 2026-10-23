@@ -15,6 +15,7 @@ mod switch;
 mod task;
 
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{MemorySet, PAGE_POLICY};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
 use alloc::vec::Vec;
@@ -101,6 +102,9 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
         inner.tasks[cur].task_status = TaskStatus::Exited;
+        if PAGE_POLICY.is_some() {
+            println!("[kernel] {:?}", inner.tasks[cur].memory_set.stats);
+        }
     }
 
     /// Find next task to run and return task id.
@@ -131,6 +135,33 @@ impl TaskManager {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
         inner.tasks[cur].change_program_brk(size)
+    }
+
+    /// Increase the call count of `syscall_id` for current task.
+    fn increase_syscall_times(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        if let Some(times) = inner.tasks[cur].syscall_times.get_mut(syscall_id) {
+            *times += 1;
+        }
+    }
+
+    /// Get the call count of `syscall_id` for current task.
+    fn get_syscall_times(&self, syscall_id: usize) -> u32 {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur]
+            .syscall_times
+            .get(syscall_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Run `f` on the current task's address space.
+    fn with_current_memory_set<T>(&self, f: impl FnOnce(&mut MemorySet) -> T) -> T {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        f(&mut inner.tasks[cur].memory_set)
     }
 
     /// Switch current `Running` task to the task we have found,
@@ -201,4 +232,19 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// Increase the call count of `syscall_id` for current task.
+pub fn increase_syscall_times(syscall_id: usize) {
+    TASK_MANAGER.increase_syscall_times(syscall_id);
+}
+
+/// Get the call count of `syscall_id` for current task.
+pub fn get_syscall_times(syscall_id: usize) -> u32 {
+    TASK_MANAGER.get_syscall_times(syscall_id)
+}
+
+/// Run `f` on the current task's address space.
+pub fn with_current_memory_set<T>(f: impl FnOnce(&mut MemorySet) -> T) -> T {
+    TASK_MANAGER.with_current_memory_set(f)
 }

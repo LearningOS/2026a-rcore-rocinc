@@ -15,6 +15,12 @@ pub const PAGE_SIZE: usize = 0x1000;
 pub const PAGE_SIZE_BITS: usize = 0xc;
 /// the max number of syscall
 pub const MAX_SYSCALL_NUM: usize = 500;
+/// resident mmap pages per task under the clock policy
+pub const CLOCK_FRAMES: usize = 16;
+/// working set window, in timer ticks
+pub const WORKING_SET_WINDOW: usize = 4;
+/// page fault interval threshold of PFF, in timer ticks
+pub const PFF_INTERVAL: usize = 2;
 /// the virtual addr of trapoline
 pub const TRAMPOLINE: usize = usize::MAX - PAGE_SIZE + 1;
 /// the virtual addr of trap context

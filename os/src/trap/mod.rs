@@ -15,9 +15,11 @@
 mod context;
 
 use crate::config::{TRAMPOLINE, TRAP_CONTEXT_BASE};
+use crate::mm::{MapPermission, VirtAddr};
 use crate::syscall::syscall;
 use crate::task::{
     current_trap_cx, current_user_token, exit_current_and_run_next, suspend_current_and_run_next,
+    with_current_memory_set,
 };
 use crate::timer::set_next_trigger;
 use core::arch::{asm, global_asm};
@@ -72,10 +74,24 @@ pub fn trap_handler() -> ! {
             // get system call return value
             cx.x[10] = syscall(cx.x[17], [cx.x[10], cx.x[11], cx.x[12]]) as usize;
         }
+        Trap::Exception(e @ Exception::LoadPageFault)
+        | Trap::Exception(e @ Exception::StorePageFault)
+        | Trap::Exception(e @ Exception::InstructionPageFault)
+            if usize::from(VirtAddr::from(stval)) == stval
+                && with_current_memory_set(|ms| {
+                    let access = match e {
+                        Exception::LoadPageFault => MapPermission::R,
+                        Exception::StorePageFault => MapPermission::W,
+                        _ => MapPermission::X,
+                    };
+                    ms.handle_page_fault(stval.into(), access)
+                }) => {}
         Trap::Exception(Exception::StoreFault)
         | Trap::Exception(Exception::StorePageFault)
         | Trap::Exception(Exception::LoadFault)
-        | Trap::Exception(Exception::LoadPageFault) => {
+        | Trap::Exception(Exception::LoadPageFault)
+        | Trap::Exception(Exception::InstructionFault)
+        | Trap::Exception(Exception::InstructionPageFault) => {
             println!("[kernel] PageFault in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.", stval, cx.sepc);
             exit_current_and_run_next();
         }
@@ -85,6 +101,7 @@ pub fn trap_handler() -> ! {
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             set_next_trigger();
+            with_current_memory_set(|ms| ms.tick());
             suspend_current_and_run_next();
         }
         _ => {

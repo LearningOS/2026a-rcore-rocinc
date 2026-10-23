@@ -70,6 +70,14 @@ impl PageTableEntry {
     pub fn executable(&self) -> bool {
         (self.flags() & PTEFlags::X) != PTEFlags::empty()
     }
+    /// The page pointered by page table entry has been accessed?
+    pub fn accessed(&self) -> bool {
+        (self.flags() & PTEFlags::A) != PTEFlags::empty()
+    }
+    /// The page pointered by page table entry has been written?
+    pub fn dirty(&self) -> bool {
+        (self.flags() & PTEFlags::D) != PTEFlags::empty()
+    }
 }
 
 /// page table structure
@@ -150,6 +158,18 @@ impl PageTable {
     /// get the page table entry from the virtual page number
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {
         self.find_pte(vpn).map(|pte| *pte)
+    }
+    /// set `flags` of the valid entry of `vpn`
+    pub fn set_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) {
+        if let Some(pte) = self.find_pte(vpn).filter(|pte| pte.is_valid()) {
+            pte.bits |= flags.bits as usize;
+        }
+    }
+    /// clear `flags` of the valid entry of `vpn`
+    pub fn clear_flags(&mut self, vpn: VirtPageNum, flags: PTEFlags) {
+        if let Some(pte) = self.find_pte(vpn).filter(|pte| pte.is_valid()) {
+            pte.bits &= !(flags.bits as usize);
+        }
     }
     /// get the token from the page table
     pub fn token(&self) -> usize {

@@ -1,19 +1,36 @@
 //! Implementation of [`MapArea`] and [`MemorySet`].
 
+use super::swap::SWAP;
 use super::{frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{
-    KERNEL_STACK_SIZE, MEMORY_END, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE,
+    CLOCK_FRAMES, KERNEL_STACK_SIZE, MEMORY_END, PAGE_SIZE, PFF_INTERVAL, TRAMPOLINE,
+    TRAP_CONTEXT_BASE, USER_STACK_SIZE, WORKING_SET_WINDOW,
 };
 use crate::sync::UPSafeCell;
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::asm;
 use lazy_static::*;
+use page_replace::{Clock, Flags, PageFaultFrequency, Pages, Replacer, WorkingSet};
 use riscv::register::satp;
+
+/// Page policy chosen at build time by `PAGE`: unset means mmap allocates eagerly,
+/// otherwise mmap pages are allocated on page fault, and `clock`/`ws`/`pff` also swap.
+pub const PAGE_POLICY: Option<&str> = option_env!("PAGE");
+
+fn replacer() -> Option<Box<dyn Replacer + Send>> {
+    match PAGE_POLICY {
+        Some("clock") => Some(Box::new(Clock::new(CLOCK_FRAMES))),
+        Some("ws") => Some(Box::new(WorkingSet::new(WORKING_SET_WINDOW))),
+        Some("pff") => Some(Box::new(PageFaultFrequency::new(PFF_INTERVAL))),
+        _ => None,
+    }
+}
 
 extern "C" {
     fn stext();
@@ -37,6 +54,59 @@ lazy_static! {
 pub struct MemorySet {
     page_table: PageTable,
     areas: Vec<MapArea>,
+    lazy: BTreeMap<VirtPageNum, LazyPage>,
+    replacer: Option<Box<dyn Replacer + Send>>,
+    /// timer ticks this address space has run for
+    ticks: usize,
+    /// paging statistics
+    pub stats: PageStats,
+}
+
+/// A page created by mmap under a lazy policy.
+struct LazyPage {
+    perm: MapPermission,
+    frame: Option<FrameTracker>,
+    /// swap slot holding the content while the page is not dirty
+    slot: Option<usize>,
+}
+
+/// Paging statistics of an address space
+#[derive(Debug, Default)]
+pub struct PageStats {
+    /// page faults handled
+    pub faults: usize,
+    /// pages read from swap
+    pub swap_ins: usize,
+    /// pages evicted
+    pub swap_outs: usize,
+}
+
+/// Resident lazy pages, viewed by the replacer.
+struct Resident<'a> {
+    page_table: &'a mut PageTable,
+    lazy: &'a mut BTreeMap<VirtPageNum, LazyPage>,
+}
+
+impl Pages for Resident<'_> {
+    fn flags(&mut self, vpn: usize) -> Option<Flags> {
+        let vpn = VirtPageNum(vpn);
+        self.lazy.get(&vpn)?.frame.as_ref()?;
+        let pte = self.page_table.translate(vpn)?;
+        Some(Flags {
+            accessed: pte.accessed(),
+            dirty: pte.dirty(),
+        })
+    }
+    fn clear_accessed(&mut self, vpn: usize) {
+        self.page_table.clear_flags(VirtPageNum(vpn), PTEFlags::A);
+    }
+    fn write_back(&mut self, vpn: usize) {
+        let vpn = VirtPageNum(vpn);
+        let page = self.lazy.get_mut(&vpn).unwrap();
+        let bytes = page.frame.as_ref().unwrap().ppn.get_bytes_array();
+        page.slot = Some(SWAP.exclusive_access().write(page.slot, bytes));
+        self.page_table.clear_flags(vpn, PTEFlags::D);
+    }
 }
 
 impl MemorySet {
@@ -45,6 +115,10 @@ impl MemorySet {
         Self {
             page_table: PageTable::new(),
             areas: Vec::new(),
+            lazy: BTreeMap::new(),
+            replacer: replacer(),
+            ticks: 0,
+            stats: PageStats::default(),
         }
     }
     /// Get the page table token
@@ -260,6 +334,144 @@ impl MemorySet {
             true
         } else {
             false
+        }
+    }
+    // 参考：rCore-Tutorial-Guide 第四章练习中 mmap/munmap 的定义，区间内已映射或存在未映射的页时失败
+    /// map [start, end) for user, fail if any page is already mapped
+    pub fn mmap(&mut self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+        let range = VPNRange::new(start.floor(), end.ceil());
+        if range.into_iter().any(|vpn| {
+            self.lazy.contains_key(&vpn) || self.translate(vpn).is_some_and(|pte| pte.is_valid())
+        }) {
+            return false;
+        }
+        if PAGE_POLICY.is_some() {
+            for vpn in range {
+                let page = LazyPage {
+                    perm,
+                    frame: None,
+                    slot: None,
+                };
+                self.lazy.insert(vpn, page);
+            }
+        } else {
+            self.insert_framed_area(start, end, perm);
+        }
+        true
+    }
+    /// unmap [start, end), fail if any page is not mapped for user
+    pub fn munmap(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        let range = VPNRange::new(start.floor(), end.ceil());
+        if !range.into_iter().all(|vpn| {
+            self.lazy.contains_key(&vpn)
+                || self
+                    .translate(vpn)
+                    .is_some_and(|pte| pte.is_valid() && pte.flags().contains(PTEFlags::U))
+        }) {
+            return false;
+        }
+        for vpn in range {
+            if let Some(page) = self.lazy.remove(&vpn) {
+                if page.frame.is_some() {
+                    self.page_table.unmap(vpn);
+                }
+                if let Some(slot) = page.slot {
+                    SWAP.exclusive_access().free(slot);
+                }
+            } else if let Some(area) = self
+                .areas
+                .iter_mut()
+                .find(|area| area.data_frames.contains_key(&vpn))
+            {
+                area.unmap_one(&mut self.page_table, vpn);
+            }
+        }
+        true
+    }
+    /// Make the lazy page at `va` resident if `access` is allowed.
+    /// Returns false if the fault is not caused by lazy allocation or swap.
+    pub fn handle_page_fault(&mut self, va: VirtAddr, access: MapPermission) -> bool {
+        let vpn = va.floor();
+        let Some(page) = self.lazy.get_mut(&vpn) else {
+            return false;
+        };
+        if !page.perm.contains(access) {
+            return false;
+        }
+        // 参考：RISC-V 特权级规范 Sv39 一节，A/D 位可由软件设置
+        // the kernel accesses user pages by physical address, so set A/D for it
+        let mut ad = PTEFlags::A;
+        if access.contains(MapPermission::W) {
+            ad |= PTEFlags::D;
+        }
+        if page.frame.is_some() {
+            // with A/D already set, the fault is caused by something else, e.g. W without R
+            if self.page_table.translate(vpn).unwrap().flags().contains(ad) {
+                return false;
+            }
+            self.page_table.set_flags(vpn, ad);
+            return true;
+        }
+        let Some(frame) = frame_alloc() else {
+            return false;
+        };
+        if let Some(slot) = page.slot {
+            SWAP.exclusive_access()
+                .read(slot, frame.ppn.get_bytes_array());
+            self.stats.swap_ins += 1;
+        }
+        let flags = PTEFlags::from_bits(page.perm.bits).unwrap() | ad;
+        self.page_table.map(vpn, frame.ppn, flags);
+        page.frame = Some(frame);
+        self.stats.faults += 1;
+        let now = self.ticks;
+        self.replace(|replacer, pages| replacer.insert(vpn.0, now, pages));
+        true
+    }
+    /// make the lazy pages of a user buffer resident before the kernel accesses it
+    pub fn fault_in(&mut self, start: VirtAddr, end: VirtAddr, access: MapPermission) {
+        for vpn in VPNRange::new(start.floor(), end.ceil()) {
+            self.handle_page_fault(vpn.into(), access);
+        }
+    }
+    /// called on each timer tick while this address space is running
+    pub fn tick(&mut self) {
+        self.ticks += 1;
+        let now = self.ticks;
+        self.replace(|replacer, pages| replacer.tick(now, pages));
+    }
+    fn replace(&mut self, f: impl FnOnce(&mut dyn Replacer, &mut dyn Pages) -> Vec<usize>) {
+        let Some(replacer) = self.replacer.as_mut() else {
+            return;
+        };
+        let mut resident = Resident {
+            page_table: &mut self.page_table,
+            lazy: &mut self.lazy,
+        };
+        let evicted = f(replacer.as_mut(), &mut resident);
+        for vpn in evicted {
+            self.swap_out(VirtPageNum(vpn));
+        }
+    }
+    fn swap_out(&mut self, vpn: VirtPageNum) {
+        let page = self.lazy.get_mut(&vpn).unwrap();
+        let frame = page.frame.take().unwrap();
+        // a clean page is either all zero or still the same as its swap slot
+        if self.page_table.translate(vpn).unwrap().dirty() {
+            let slot = SWAP
+                .exclusive_access()
+                .write(page.slot, frame.ppn.get_bytes_array());
+            page.slot = Some(slot);
+        }
+        self.page_table.unmap(vpn);
+        self.stats.swap_outs += 1;
+    }
+}
+
+impl Drop for MemorySet {
+    fn drop(&mut self) {
+        for slot in self.lazy.values().filter_map(|page| page.slot) {
+            SWAP.exclusive_access().free(slot);
         }
     }
 }

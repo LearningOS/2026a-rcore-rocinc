@@ -1,7 +1,7 @@
 //! File and filesystem-related syscalls
 
-use crate::mm::translated_byte_buffer;
-use crate::task::current_user_token;
+use crate::mm::{translated_byte_buffer, MapPermission};
+use crate::task::{current_user_token, with_current_memory_set};
 
 const FD_STDOUT: usize = 1;
 
@@ -10,6 +10,8 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
     trace!("kernel: sys_write");
     match fd {
         FD_STDOUT => {
+            let (start, end) = ((buf as usize).into(), (buf as usize + len).into());
+            with_current_memory_set(|ms| ms.fault_in(start, end, MapPermission::R));
             let buffers = translated_byte_buffer(current_user_token(), buf, len);
             for buffer in buffers {
                 print!("{}", core::str::from_utf8(buffer).unwrap());
