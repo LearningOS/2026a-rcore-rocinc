@@ -24,11 +24,14 @@ const SYSCALL_TRACE: usize = 410;
 mod fs;
 mod process;
 
+use crate::task::TASK_MANAGER;
 use fs::*;
 use process::*;
 
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 3]) -> isize {
+    // 参考：rCore-Tutorial-Guide 第三章练习提示“系统调用次数可以考虑在内核态的 syscall 函数中统计”，在分发前计数使本次调用也计入
+    TASK_MANAGER.increase_syscall_times(syscall_id);
     match syscall_id {
         SYSCALL_WRITE => sys_write(args[0], args[1] as *const u8, args[2]),
         SYSCALL_EXIT => sys_exit(args[0] as i32),

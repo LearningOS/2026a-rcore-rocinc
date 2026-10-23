@@ -1,6 +1,6 @@
 //! Process management syscalls
 use crate::{
-    task::{exit_current_and_run_next, suspend_current_and_run_next},
+    task::{exit_current_and_run_next, suspend_current_and_run_next, TASK_MANAGER},
     timer::get_time_us,
 };
 
@@ -38,8 +38,17 @@ pub fn sys_get_time(ts: *mut TimeVal, _tz: usize) -> isize {
     0
 }
 
-// TODO: implement the syscall
-pub fn sys_trace(_trace_request: usize, _id: usize, _data: usize) -> isize {
+// 参考：rCore-Tutorial-Guide 第三章练习中 sys_trace 的调用规范，以及“不要求实现安全检查机制”的说明
+/// trace memory access or syscall count of current task
+pub fn sys_trace(trace_request: usize, id: usize, data: usize) -> isize {
     trace!("kernel: sys_trace");
-    -1
+    match trace_request {
+        0 => unsafe { *(id as *const u8) as isize },
+        1 => {
+            unsafe { *(id as *mut u8) = data as u8 };
+            0
+        }
+        2 => TASK_MANAGER.get_syscall_times(id) as isize,
+        _ => -1,
+    }
 }
