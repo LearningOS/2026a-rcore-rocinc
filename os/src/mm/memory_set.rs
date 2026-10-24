@@ -233,25 +233,70 @@ impl MemorySet {
             elf.header.pt2.entry_point() as usize,
         )
     }
-    /// Create a new address space by copy code&data from a exited process's address space.
-    pub fn from_existed_user(user_space: &Self) -> Self {
+    /// Create a new address space that shares the user pages of `user_space` copy-on-write.
+    pub fn from_existed_user(user_space: &mut Self) -> Self {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
-        // copy data sections/trap_context/user_stack
         for area in user_space.areas.iter() {
-            let new_area = MapArea::from_another(area);
-            memory_set.push(new_area, None);
-            // copy data from another space
-            for vpn in area.vpn_range {
-                let src_ppn = user_space.translate(vpn).unwrap().ppn();
-                let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
-                dst_ppn
-                    .get_bytes_array()
-                    .copy_from_slice(src_ppn.get_bytes_array());
+            let mut new_area = MapArea::from_another(area);
+            if area.map_perm.contains(MapPermission::U) {
+                // both sides map the frame read-only until one of them writes
+                let flags = PTEFlags::from_bits(area.map_perm.bits).unwrap() - PTEFlags::W;
+                for (&vpn, frame) in area.data_frames.iter() {
+                    user_space.page_table.remap(vpn, frame.ppn, flags);
+                    memory_set.page_table.map(vpn, frame.ppn, flags);
+                    new_area.data_frames.insert(vpn, frame.clone());
+                }
+            } else {
+                // the kernel writes the trap context directly, so copy it now
+                for &vpn in area.data_frames.keys() {
+                    new_area.map_one(&mut memory_set.page_table, vpn);
+                    let src_ppn = user_space.translate(vpn).unwrap().ppn();
+                    let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
+                    dst_ppn
+                        .get_bytes_array()
+                        .copy_from_slice(src_ppn.get_bytes_array());
+                }
             }
+            memory_set.areas.push(new_area);
         }
         memory_set
+    }
+    // 参考：RISC-V 特权级规范中 Store/AMO Page Fault 的触发条件，写 W=0 的有效页面时产生该异常，stval 为出错地址
+    /// Give `vpn` a frame of its own if it is shared copy-on-write.
+    /// Returns false if `vpn` is not a copy-on-write page.
+    pub fn copy_on_write(&mut self, vpn: VirtPageNum) -> bool {
+        let Some(area) = self
+            .areas
+            .iter_mut()
+            .find(|area| area.data_frames.contains_key(&vpn))
+        else {
+            return false;
+        };
+        if self.page_table.translate(vpn).unwrap().writable()
+            || !area.map_perm.contains(MapPermission::W)
+        {
+            return false;
+        }
+        let frame = area.data_frames.get_mut(&vpn).unwrap();
+        // only holders can share it further, so a single owner may write in place
+        if Arc::get_mut(frame).is_none() {
+            let copy = frame_alloc().unwrap();
+            copy.ppn
+                .get_bytes_array()
+                .copy_from_slice(frame.ppn.get_bytes_array());
+            *frame = Arc::new(copy);
+        }
+        let flags = PTEFlags::from_bits(area.map_perm.bits).unwrap();
+        self.page_table.remap(vpn, frame.ppn, flags);
+        true
+    }
+    /// Resolve copy-on-write in [start, end) before the kernel writes there.
+    pub fn prepare_write(&mut self, start: VirtAddr, end: VirtAddr) {
+        for vpn in VPNRange::new(start.floor(), end.ceil()) {
+            self.copy_on_write(vpn);
+        }
     }
     /// Change page table by writing satp CSR Register.
     pub fn activate(&self) {
@@ -300,11 +345,43 @@ impl MemorySet {
             false
         }
     }
+    /// map [start, end) for user, fail if any page is already mapped
+    pub fn mmap(&mut self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+        let range = VPNRange::new(start.floor(), end.ceil());
+        if range
+            .into_iter()
+            .any(|vpn| self.translate(vpn).is_some_and(|pte| pte.is_valid()))
+        {
+            return false;
+        }
+        self.insert_framed_area(start, end, perm);
+        true
+    }
+    /// unmap [start, end), fail if any page is not mapped for user
+    pub fn munmap(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        let range = VPNRange::new(start.floor(), end.ceil());
+        if !range.into_iter().all(|vpn| {
+            self.translate(vpn)
+                .is_some_and(|pte| pte.is_valid() && pte.flags().contains(PTEFlags::U))
+        }) {
+            return false;
+        }
+        for vpn in range {
+            if let Some(area) = self
+                .areas
+                .iter_mut()
+                .find(|area| area.data_frames.contains_key(&vpn))
+            {
+                area.unmap_one(&mut self.page_table, vpn);
+            }
+        }
+        true
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
     vpn_range: VPNRange,
-    data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    data_frames: BTreeMap<VirtPageNum, Arc<FrameTracker>>,
     map_type: MapType,
     map_perm: MapPermission,
 }
@@ -342,7 +419,7 @@ impl MapArea {
             MapType::Framed => {
                 let frame = frame_alloc().unwrap();
                 ppn = frame.ppn;
-                self.data_frames.insert(vpn, frame);
+                self.data_frames.insert(vpn, Arc::new(frame));
             }
         }
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();

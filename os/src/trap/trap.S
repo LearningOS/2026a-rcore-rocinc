@@ -16,7 +16,8 @@ __alltraps:
     sd x1, 1*8(sp)
     # skip sp(x2), we will save it later
     sd x3, 3*8(sp)
-    # skip tp(x4), application does not use it
+    # tp(x4) holds the hart id saved by __restore, not a user value
+    ld tp, 4*8(sp)
     # save x5~x31
     .set n, 5
     .rept 27
@@ -51,6 +52,8 @@ __restore:
     csrw sscratch, a0
     mv sp, a0
     # now sp points to TrapContext in user space, start restoring based on it
+    # keep the hart id for __alltraps, the task may run on another hart next time
+    sd tp, 4*8(sp)
     # restore sstatus/sepc
     ld t0, 32*8(sp)
     ld t1, 33*8(sp)

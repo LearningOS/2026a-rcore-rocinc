@@ -39,6 +39,12 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
                 }
             }
             let ch = c as u8;
+            let start = buf as usize;
+            current_task()
+                .unwrap()
+                .inner_exclusive_access()
+                .memory_set
+                .prepare_write(start.into(), (start + len).into());
             let mut buffers = translated_byte_buffer(current_user_token(), buf, len);
             unsafe {
                 buffers[0].as_mut_ptr().write_volatile(ch);

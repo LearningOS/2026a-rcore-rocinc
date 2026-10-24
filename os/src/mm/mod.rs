@@ -22,5 +22,9 @@ use page_table::{PTEFlags, PageTable};
 pub fn init() {
     heap_allocator::init_heap();
     frame_allocator::init_frame_allocator();
+    activate_kernel_space();
+}
+/// switch the current hart to kernel space
+pub fn activate_kernel_space() {
     KERNEL_SPACE.exclusive_access().activate();
 }

@@ -8,6 +8,7 @@ const SBI_SET_TIMER: usize = 0;
 const SBI_CONSOLE_PUTCHAR: usize = 1;
 const SBI_CONSOLE_GETCHAR: usize = 2;
 const SBI_SYSTEM_RESET: usize = 0x53525354;
+const SBI_HSM: usize = 0x48534D;
 
 /// general sbi call
 #[inline(always)]
@@ -45,6 +46,23 @@ pub fn console_getchar() -> usize {
     } else {
         ch
     }
+}
+
+// 参考：RISC-V SBI 规范 HSM 扩展中 sbi_hart_start 的参数与返回值
+/// start a stopped hart at `start_addr` in S-mode with a0 = hartid, return false if it fails
+pub fn hart_start(hartid: usize, start_addr: usize) -> bool {
+    let error: isize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") SBI_HSM,
+            in("a6") 0,
+            inlateout("a0") hartid => error,
+            inlateout("a1") start_addr => _,
+            in("a2") 0,
+        );
+    }
+    error == 0
 }
 
 /// use sbi call to shutdown the kernel

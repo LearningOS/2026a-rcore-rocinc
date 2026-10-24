@@ -15,9 +15,11 @@
 mod context;
 
 use crate::config::{TRAMPOLINE, TRAP_CONTEXT_BASE};
+use crate::mm::VirtAddr;
 use crate::syscall::syscall;
 use crate::task::{
-    current_trap_cx, current_user_token, exit_current_and_run_next, suspend_current_and_run_next,
+    current_task, current_trap_cx, current_user_token, exit_current_and_run_next,
+    suspend_current_and_run_next, tick_task,
 };
 use crate::timer::set_next_trigger;
 use core::arch::{asm, global_asm};
@@ -74,6 +76,12 @@ pub fn trap_handler() -> ! {
             cx = current_trap_cx();
             cx.x[10] = result as usize;
         }
+        Trap::Exception(Exception::StorePageFault)
+            if current_task()
+                .unwrap()
+                .inner_exclusive_access()
+                .memory_set
+                .copy_on_write(VirtAddr::from(stval).floor()) => {}
         Trap::Exception(Exception::StoreFault)
         | Trap::Exception(Exception::StorePageFault)
         | Trap::Exception(Exception::InstructionFault)
@@ -96,6 +104,7 @@ pub fn trap_handler() -> ! {
         }
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             set_next_trigger();
+            tick_task(&current_task().unwrap());
             suspend_current_and_run_next();
         }
         _ => {

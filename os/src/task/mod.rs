@@ -30,7 +30,7 @@ pub use task::{TaskControlBlock, TaskStatus};
 
 pub use context::TaskContext;
 pub use id::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-pub use manager::add_task;
+pub use manager::{add_task, tick_task};
 pub use processor::{
     current_task, current_trap_cx, current_user_token, run_tasks, schedule, take_current_task,
     Processor,
@@ -40,18 +40,11 @@ pub fn suspend_current_and_run_next() {
     // There must be an application running.
     let task = take_current_task().unwrap();
 
-    // ---- access current TCB exclusively
     let mut task_inner = task.inner_exclusive_access();
     let task_cx_ptr = &mut task_inner.task_cx as *mut TaskContext;
-    // Change status to Ready
-    task_inner.task_status = TaskStatus::Ready;
     drop(task_inner);
-    // ---- release current PCB
-
-    // push back to ready queue.
-    add_task(task);
-    // jump to scheduling cycle
-    schedule(task_cx_ptr);
+    // jump to scheduling cycle, which pushes it back to ready queue
+    schedule(task_cx_ptr, task, TaskStatus::Ready);
 }
 
 /// pid of usertests app in make run TEST=1
@@ -73,32 +66,29 @@ pub fn exit_current_and_run_next(exit_code: i32) {
 
     // **** access current TCB exclusively
     let mut inner = task.inner_exclusive_access();
-    // Change status to Zombie
-    inner.task_status = TaskStatus::Zombie;
     // Record exit code
     inner.exit_code = exit_code;
-    // do not move to its parent but under initproc
+    // deallocate user space
+    inner.memory_set.recycle_data_pages();
+    let children = core::mem::take(&mut inner.children);
+    drop(inner);
+    // **** release current PCB, since initproc locks its children in waitpid
 
+    // do not move to its parent but under initproc
     // ++++++ access initproc TCB exclusively
     {
         let mut initproc_inner = INITPROC.inner_exclusive_access();
-        for child in inner.children.iter() {
+        for child in children {
             child.inner_exclusive_access().parent = Some(Arc::downgrade(&INITPROC));
-            initproc_inner.children.push(child.clone());
+            initproc_inner.children.push(child);
         }
     }
     // ++++++ release parent PCB
 
-    inner.children.clear();
-    // deallocate user space
-    inner.memory_set.recycle_data_pages();
-    drop(inner);
-    // **** release current PCB
-    // drop task manually to maintain rc correctly
-    drop(task);
-    // we do not have to save task context
+    // we do not have to save task context;
+    // it becomes Zombie only after leaving its kernel stack
     let mut _unused = TaskContext::zero_init();
-    schedule(&mut _unused as *mut _);
+    schedule(&mut _unused as *mut _, task, TaskStatus::Zombie);
 }
 
 lazy_static! {
