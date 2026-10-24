@@ -1,15 +1,18 @@
 //! Address Space [`MemorySet`] management of Process
 
-use super::{frame_alloc, FrameTracker};
+use super::{flush_tlb, frame_alloc, FrameTracker};
 use super::{PTEFlags, PageTable, PageTableEntry};
 use super::{PhysAddr, PhysPageNum, VirtAddr, VirtPageNum};
 use super::{StepByOne, VPNRange};
 use crate::config::{MEMORY_END, MMIO, PAGE_SIZE, TRAMPOLINE};
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::arch::asm;
+use easy_fs::Inode;
 use lazy_static::*;
 use riscv::register::satp;
 
@@ -179,21 +182,30 @@ impl MemorySet {
         }
         memory_set
     }
-    /// Include sections in elf and trampoline and TrapContext and user stack,
+    /// Include sections in elf and trampoline,
     /// also returns user_sp_base and entry point.
-    pub fn from_elf(elf_data: &[u8]) -> (Self, usize, usize) {
+    /// Sections in elf are loaded from `elf` page by page when first accessed.
+    pub fn from_elf(elf: &Arc<Inode>) -> (Self, usize, usize) {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
-        // map program headers of elf, with U flag
-        let elf = xmas_elf::ElfFile::new(elf_data).unwrap();
-        let elf_header = elf.header;
+        // read the elf header, then the program headers following it
+        let mut elf_data = vec![0u8; 64];
+        elf.read_at(0, &mut elf_data);
+        let ph_end = {
+            let pt2 = xmas_elf::ElfFile::new(&elf_data).unwrap().header.pt2;
+            pt2.ph_offset() as usize + pt2.ph_count() as usize * pt2.ph_entry_size() as usize
+        };
+        elf_data.resize(ph_end, 0);
+        elf.read_at(0, &mut elf_data);
+        let elf_file = xmas_elf::ElfFile::new(&elf_data).unwrap();
+        let elf_header = elf_file.header;
         let magic = elf_header.pt1.magic;
         assert_eq!(magic, [0x7f, 0x45, 0x4c, 0x46], "invalid elf!");
         let ph_count = elf_header.pt2.ph_count();
         let mut max_end_vpn = VirtPageNum(0);
         for i in 0..ph_count {
-            let ph = elf.program_header(i).unwrap();
+            let ph = elf_file.program_header(i).unwrap();
             if ph.get_type().unwrap() == xmas_elf::program::Type::Load {
                 let start_va: VirtAddr = (ph.virtual_addr() as usize).into();
                 let end_va: VirtAddr = ((ph.virtual_addr() + ph.mem_size()) as usize).into();
@@ -208,43 +220,194 @@ impl MemorySet {
                 if ph_flags.is_execute() {
                     map_perm |= MapPermission::X;
                 }
-                let map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
+                let mut map_area = MapArea::new(start_va, end_va, MapType::Framed, map_perm);
+                map_area.file = Some(FileSegment {
+                    inode: elf.clone(),
+                    va: ph.virtual_addr() as usize,
+                    offset: ph.offset() as usize,
+                    size: ph.file_size() as usize,
+                });
                 max_end_vpn = map_area.vpn_range.get_end();
-                memory_set.push(
-                    map_area,
-                    Some(&elf.input[ph.offset() as usize..(ph.offset() + ph.file_size()) as usize]),
-                );
+                memory_set.areas.push(map_area);
             }
         }
-        // map user stack with U flags
         let max_end_va: VirtAddr = max_end_vpn.into();
         let mut user_stack_base: usize = max_end_va.into();
         user_stack_base += PAGE_SIZE;
         (
             memory_set,
             user_stack_base,
-            elf.header.pt2.entry_point() as usize,
+            elf_header.pt2.entry_point() as usize,
         )
     }
-    /// Create a new address space by copy code&data from a exited process's address space.
-    pub fn from_existed_user(user_space: &Self) -> Self {
+    /// Create a new address space that shares the user pages of `user_space` copy-on-write.
+    pub fn from_existed_user(user_space: &mut Self) -> Self {
         let mut memory_set = Self::new_bare();
         // map trampoline
         memory_set.map_trampoline();
-        // copy data sections/trap_context/user_stack
         for area in user_space.areas.iter() {
-            let new_area = MapArea::from_another(area);
-            memory_set.push(new_area, None);
-            // copy data from another space
-            for vpn in area.vpn_range {
-                let src_ppn = user_space.translate(vpn).unwrap().ppn();
-                let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
-                dst_ppn
-                    .get_bytes_array()
-                    .copy_from_slice(src_ppn.get_bytes_array());
+            let mut new_area = MapArea::from_another(area);
+            if area.map_perm.contains(MapPermission::U) {
+                // both sides map the frame read-only until one of them writes
+                let flags = PTEFlags::from_bits(area.map_perm.bits).unwrap() - PTEFlags::W;
+                for (&vpn, frame) in area.data_frames.iter() {
+                    user_space.page_table.remap(vpn, frame.ppn, flags);
+                    memory_set.page_table.map(vpn, frame.ppn, flags);
+                    new_area.data_frames.insert(vpn, frame.clone());
+                }
+            } else {
+                // the kernel writes the trap context directly, so copy it now
+                for &vpn in area.data_frames.keys() {
+                    new_area.map_one(&mut memory_set.page_table, vpn);
+                    let src_ppn = user_space.translate(vpn).unwrap().ppn();
+                    let dst_ppn = memory_set.translate(vpn).unwrap().ppn();
+                    dst_ppn
+                        .get_bytes_array()
+                        .copy_from_slice(src_ppn.get_bytes_array());
+                }
             }
+            memory_set.areas.push(new_area);
         }
         memory_set
+    }
+    // 参考：RISC-V 特权级规范中 Store/AMO Page Fault 的触发条件，写 W=0 的有效页面时产生该异常，stval 为出错地址
+    /// Give `vpn` a frame of its own if it is shared copy-on-write.
+    /// Returns false if `vpn` is not a copy-on-write page.
+    pub fn copy_on_write(&mut self, vpn: VirtPageNum) -> bool {
+        let Some(area) = self
+            .areas
+            .iter_mut()
+            .find(|area| area.data_frames.contains_key(&vpn))
+        else {
+            return false;
+        };
+        if self.page_table.translate(vpn).unwrap().writable()
+            || !area.map_perm.contains(MapPermission::W)
+        {
+            return false;
+        }
+        let frame = area.data_frames.get_mut(&vpn).unwrap();
+        // only holders can share it further, so a single owner may write in place
+        let copied = Arc::get_mut(frame).is_none();
+        if copied {
+            let copy = frame_alloc().unwrap();
+            copy.ppn
+                .get_bytes_array()
+                .copy_from_slice(frame.ppn.get_bytes_array());
+            *frame = Arc::new(copy);
+        }
+        let flags = PTEFlags::from_bits(area.map_perm.bits).unwrap();
+        self.page_table.remap(vpn, frame.ppn, flags);
+        // other threads of this process may still map the old frame on other harts
+        if copied {
+            flush_tlb(VirtAddr::from(vpn).0, PAGE_SIZE);
+        }
+        true
+    }
+    /// Load `vpn` from the file if it belongs to a section not loaded yet.
+    fn load_page(&mut self, vpn: VirtPageNum) -> bool {
+        let Some(area) = self.areas.iter_mut().find(|area| {
+            area.file.is_some()
+                && area.vpn_range.get_start() <= vpn
+                && vpn < area.vpn_range.get_end()
+                && !area.data_frames.contains_key(&vpn)
+        }) else {
+            return false;
+        };
+        area.map_one(&mut self.page_table, vpn);
+        let file = area.file.as_ref().unwrap();
+        let page_va = VirtAddr::from(vpn).0;
+        let start = page_va.max(file.va);
+        let end = (page_va + PAGE_SIZE).min(file.va + file.size);
+        if start < end {
+            let page = self
+                .page_table
+                .translate(vpn)
+                .unwrap()
+                .ppn()
+                .get_bytes_array();
+            file.inode.read_at(
+                file.offset + start - file.va,
+                &mut page[start - page_va..end - page_va],
+            );
+        }
+        true
+    }
+    /// Handle a user page fault at `vpn` caused by `access` (`R`, `W` or `X`)
+    /// for demand paging or copy-on-write.
+    pub fn handle_page_fault(&mut self, vpn: VirtPageNum, access: PTEFlags) -> bool {
+        self.load_page(vpn)
+            || (access == PTEFlags::W && self.copy_on_write(vpn))
+            // another hart has resolved it, and this hart only had a stale TLB entry
+            || self
+                .translate(vpn)
+                .is_some_and(|pte| pte.flags().contains(PTEFlags::V | PTEFlags::U | access))
+    }
+    /// Load the pages in [start, end) before the kernel reads there.
+    pub fn prepare_read(&mut self, start: VirtAddr, end: VirtAddr) {
+        for vpn in VPNRange::new(start.floor(), end.ceil()) {
+            self.load_page(vpn);
+        }
+    }
+    /// Load the pages and resolve copy-on-write in [start, end) before the kernel writes there.
+    pub fn prepare_write(&mut self, start: VirtAddr, end: VirtAddr) {
+        for vpn in VPNRange::new(start.floor(), end.ceil()) {
+            self.load_page(vpn);
+            self.copy_on_write(vpn);
+        }
+    }
+    /// Read a string ending with `\0` at `ptr`, loading its pages first.
+    pub fn read_str(&mut self, ptr: *const u8) -> String {
+        let mut string = String::new();
+        let mut va = ptr as usize;
+        loop {
+            self.load_page(VirtAddr::from(va).floor());
+            let ch: u8 = *self.page_table.translate_va(va.into()).unwrap().get_mut();
+            if ch == 0 {
+                break;
+            }
+            string.push(ch as char);
+            va += 1;
+        }
+        string
+    }
+    /// map [start, end) for user, fail if any page is already mapped
+    pub fn mmap(&mut self, start: VirtAddr, end: VirtAddr, perm: MapPermission) -> bool {
+        let range = VPNRange::new(start.floor(), end.ceil());
+        // sections not loaded yet are taken as well
+        if range.into_iter().any(|vpn| {
+            self.translate(vpn).is_some_and(|pte| pte.is_valid())
+                || self.areas.iter().any(|area| {
+                    area.file.is_some()
+                        && area.vpn_range.get_start() <= vpn
+                        && vpn < area.vpn_range.get_end()
+                })
+        }) {
+            return false;
+        }
+        self.insert_framed_area(start, end, perm);
+        true
+    }
+    /// unmap [start, end), fail if any page is not mapped for user
+    pub fn munmap(&mut self, start: VirtAddr, end: VirtAddr) -> bool {
+        let range = VPNRange::new(start.floor(), end.ceil());
+        if !range.into_iter().all(|vpn| {
+            self.translate(vpn)
+                .is_some_and(|pte| pte.is_valid() && pte.flags().contains(PTEFlags::U))
+        }) {
+            return false;
+        }
+        for vpn in range {
+            if let Some(area) = self
+                .areas
+                .iter_mut()
+                .find(|area| area.data_frames.contains_key(&vpn))
+            {
+                area.unmap_one(&mut self.page_table, vpn);
+            }
+        }
+        flush_tlb(start.0, end.0 - start.0);
+        true
     }
     /// Change page table by writing satp CSR Register.
     pub fn activate(&self) {
@@ -297,9 +460,20 @@ impl MemorySet {
 
 pub struct MapArea {
     pub vpn_range: VPNRange,
-    pub data_frames: BTreeMap<VirtPageNum, FrameTracker>,
+    pub data_frames: BTreeMap<VirtPageNum, Arc<FrameTracker>>,
     pub map_type: MapType,
     pub map_perm: MapPermission,
+    /// where the area is loaded from on demand
+    file: Option<FileSegment>,
+}
+
+/// `size` bytes at `offset` of the file, which are mapped at `va`
+#[derive(Clone)]
+struct FileSegment {
+    inode: Arc<Inode>,
+    va: usize,
+    offset: usize,
+    size: usize,
 }
 
 impl MapArea {
@@ -316,6 +490,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type,
             map_perm,
+            file: None,
         }
     }
     pub fn from_another(another: &Self) -> Self {
@@ -324,6 +499,7 @@ impl MapArea {
             data_frames: BTreeMap::new(),
             map_type: another.map_type,
             map_perm: another.map_perm,
+            file: another.file.clone(),
         }
     }
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
@@ -335,7 +511,7 @@ impl MapArea {
             MapType::Framed => {
                 let frame = frame_alloc().unwrap();
                 ppn = frame.ppn;
-                self.data_frames.insert(vpn, frame);
+                self.data_frames.insert(vpn, Arc::new(frame));
             }
         }
         let pte_flags = PTEFlags::from_bits(self.map_perm.bits).unwrap();

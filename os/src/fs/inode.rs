@@ -1,4 +1,4 @@
-use super::File;
+use super::{File, Stat, StatMode};
 use crate::drivers::BLOCK_DEVICE;
 use crate::mm::UserBuffer;
 use crate::sync::UPSafeCell;
@@ -49,7 +49,15 @@ impl OSInode {
     }
 }
 
+impl OSInode {
+    /// the inode in the file system
+    pub fn inode(&self) -> Arc<Inode> {
+        self.inner.exclusive_access().inode.clone()
+    }
+}
+
 lazy_static! {
+    /// The root directory, which holds all the files
     pub static ref ROOT_INODE: Arc<Inode> = {
         let efs = EasyFileSystem::open(BLOCK_DEVICE.clone());
         Arc::new(EasyFileSystem::root_inode(&efs))
@@ -156,5 +164,15 @@ impl File for OSInode {
             total_write_size += write_size;
         }
         total_write_size
+    }
+    fn stat(&self) -> Option<Stat> {
+        let inode = self.inode();
+        let ino = inode.inode_id();
+        let mode = if inode.is_dir() {
+            StatMode::DIR
+        } else {
+            StatMode::FILE
+        };
+        Some(Stat::new(ino as u64, mode, ROOT_INODE.nlink(ino)))
     }
 }

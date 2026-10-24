@@ -11,6 +11,10 @@ const SBI_CONSOLE_PUTCHAR: usize = 1;
 const SBI_CONSOLE_GETCHAR: usize = 2;
 /// shutdown sbi call id
 const SBI_SYSTEM_RESET: usize = 0x53525354;
+/// hart state management extension id
+const SBI_HSM: usize = 0x48534D;
+/// remote fence extension id
+const SBI_RFENCE: usize = 0x52464E43;
 
 /// general sbi call
 #[inline(always)]
@@ -48,6 +52,40 @@ pub fn console_getchar() -> usize {
     } else {
         ch
     }
+}
+
+/// start a stopped hart at `start_addr` in S-mode with a0 = hartid, return false if it fails
+pub fn hart_start(hartid: usize, start_addr: usize) -> bool {
+    let error: isize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") SBI_HSM,
+            in("a6") 0,
+            inlateout("a0") hartid => error,
+            inlateout("a1") start_addr => _,
+            in("a2") 0,
+        );
+    }
+    error == 0
+}
+
+// 参考：RISC-V SBI 规范 RFENCE 扩展中 sbi_remote_sfence_vma 的参数，目标 hart 须处于 STARTED 状态
+/// flush the TLB entries of [start, start + size) on the harts in `hart_mask`
+pub fn remote_sfence_vma(hart_mask: usize, start: usize, size: usize) {
+    let error: isize;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a7") SBI_RFENCE,
+            in("a6") 1,
+            inlateout("a0") hart_mask => error,
+            inlateout("a1") 0usize => _,
+            in("a2") start,
+            in("a3") size,
+        );
+    }
+    assert_eq!(error, 0);
 }
 
 /// use sbi call to shutdown the kernel

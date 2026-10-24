@@ -15,10 +15,12 @@
 mod context;
 
 use crate::config::TRAMPOLINE;
+use crate::mm::{PTEFlags, VirtAddr};
 use crate::syscall::syscall;
 use crate::task::{
-    check_signals_of_current, current_add_signal, current_trap_cx, current_trap_cx_user_va,
-    current_user_token, exit_current_and_run_next, suspend_current_and_run_next, SignalFlags,
+    check_signals_of_current, current_add_signal, current_process, current_task, current_trap_cx,
+    current_trap_cx_user_va, current_user_token, exit_current_and_run_next,
+    suspend_current_and_run_next, tick_task, SignalFlags,
 };
 use crate::timer::{check_timer, set_next_trigger};
 use core::arch::{asm, global_asm};
@@ -75,6 +77,19 @@ pub fn trap_handler() -> ! {
             cx = current_trap_cx();
             cx.x[10] = result as usize;
         }
+        Trap::Exception(
+            Exception::StorePageFault | Exception::LoadPageFault | Exception::InstructionPageFault,
+        ) if current_process()
+            .inner_exclusive_access()
+            .memory_set
+            .handle_page_fault(
+                VirtAddr::from(stval).floor(),
+                match scause.cause() {
+                    Trap::Exception(Exception::StorePageFault) => PTEFlags::W,
+                    Trap::Exception(Exception::LoadPageFault) => PTEFlags::R,
+                    _ => PTEFlags::X,
+                },
+            ) => {}
         Trap::Exception(Exception::StoreFault)
         | Trap::Exception(Exception::StorePageFault)
         | Trap::Exception(Exception::InstructionFault)
@@ -95,6 +110,7 @@ pub fn trap_handler() -> ! {
         Trap::Interrupt(Interrupt::SupervisorTimer) => {
             set_next_trigger();
             check_timer();
+            tick_task(&current_task().unwrap());
             suspend_current_and_run_next();
         }
         _ => {
@@ -104,6 +120,10 @@ pub fn trap_handler() -> ! {
                 stval
             );
         }
+    }
+    // the process has exited on another hart
+    if current_task().unwrap().inner_exclusive_access().killed {
+        exit_current_and_run_next(-1);
     }
     // check signals
     if let Some((errno, msg)) = check_signals_of_current() {

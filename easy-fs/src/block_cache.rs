@@ -9,8 +9,8 @@ use lazy_static::*;
 use spin::Mutex;
 /// BlockCache is a cache for a block in disk.
 pub struct BlockCache {
-    cache: Vec<u8>,
-    block_id: usize,
+    pub(crate) cache: Vec<u8>,
+    pub(crate) block_id: usize,
     block_device: Arc<dyn BlockDevice>,
     modified: bool,
 }
@@ -76,12 +76,18 @@ impl Drop for BlockCache {
     }
 }
 
-const BLOCK_CACHE_SIZE: usize = 16;
+/// More blocks than an operation modifies
+const BLOCK_CACHE_SIZE: usize = 64;
+
+/// Identify a device by its address, so that a cache never serves another device
+fn device_id(block_device: &Arc<dyn BlockDevice>) -> usize {
+    Arc::as_ptr(block_device) as *const () as usize
+}
 
 /// BlockCacheManager is a manager for BlockCache.
 pub struct BlockCacheManager {
-    /// (block_id, block_cache)
-    queue: VecDeque<(usize, Arc<Mutex<BlockCache>>)>,
+    /// ((device, block_id), block_cache)
+    queue: VecDeque<((usize, usize), Arc<Mutex<BlockCache>>)>,
 }
 
 impl BlockCacheManager {
@@ -97,7 +103,8 @@ impl BlockCacheManager {
         block_id: usize,
         block_device: Arc<dyn BlockDevice>,
     ) -> Arc<Mutex<BlockCache>> {
-        if let Some(pair) = self.queue.iter().find(|pair| pair.0 == block_id) {
+        let key = (device_id(&block_device), block_id);
+        if let Some(pair) = self.queue.iter().find(|pair| pair.0 == key) {
             Arc::clone(&pair.1)
         } else {
             // substitute
@@ -107,7 +114,8 @@ impl BlockCacheManager {
                     .queue
                     .iter()
                     .enumerate()
-                    .find(|(_, pair)| Arc::strong_count(&pair.1) == 1)
+                    // modified blocks wait for the journal to commit them
+                    .find(|(_, pair)| Arc::strong_count(&pair.1) == 1 && !pair.1.lock().modified)
                 {
                     self.queue.drain(idx..=idx);
                 } else {
@@ -119,7 +127,7 @@ impl BlockCacheManager {
                 block_id,
                 Arc::clone(&block_device),
             )));
-            self.queue.push_back((block_id, Arc::clone(&block_cache)));
+            self.queue.push_back((key, Arc::clone(&block_cache)));
             block_cache
         }
     }
@@ -138,6 +146,17 @@ pub fn get_block_cache(
     BLOCK_CACHE_MANAGER
         .lock()
         .get_block_cache(block_id, block_device)
+}
+/// Get the modified block caches of the given block device
+pub fn dirty_block_caches(block_device: &Arc<dyn BlockDevice>) -> Vec<Arc<Mutex<BlockCache>>> {
+    let id = device_id(block_device);
+    BLOCK_CACHE_MANAGER
+        .lock()
+        .queue
+        .iter()
+        .filter(|(key, cache)| key.0 == id && cache.lock().modified)
+        .map(|(_, cache)| Arc::clone(cache))
+        .collect()
 }
 /// Sync(write) all the block cache to disk.
 pub fn block_cache_sync_all() {

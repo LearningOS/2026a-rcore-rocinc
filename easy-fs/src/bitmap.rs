@@ -31,30 +31,41 @@ impl Bitmap {
     /// Allocate a block according to the bitmap info
     pub fn alloc(&self, block_device: &Arc<dyn BlockDevice>) -> Option<usize> {
         for block_id in 0..self.blocks {
-            let pos = get_block_cache(
-                block_id + self.start_block_id as usize,
-                Arc::clone(block_device),
-            )
-            .lock()
-            .modify(0, |bitmap_block: &mut BitmapBlock| {
-                if let Some((bits64_pos, inner_pos)) = bitmap_block
+            let block_cache =
+                get_block_cache(block_id + self.start_block_id, Arc::clone(block_device));
+            let mut cache = block_cache.lock();
+            // only the block that changes is modified, keeping transactions small
+            let Some((bits64_pos, inner_pos)) = cache.read(0, |bitmap_block: &BitmapBlock| {
+                bitmap_block
                     .iter()
                     .enumerate()
                     .find(|(_, bits64)| **bits64 != u64::MAX)
                     .map(|(bits64_pos, bits64)| (bits64_pos, bits64.trailing_ones() as usize))
-                {
-                    // modify cache
-                    bitmap_block[bits64_pos] |= 1u64 << inner_pos;
-                    Some(block_id * BLOCK_BITS + bits64_pos * 64 + inner_pos as usize)
-                } else {
-                    None
-                }
+            }) else {
+                continue;
+            };
+            cache.modify(0, |bitmap_block: &mut BitmapBlock| {
+                bitmap_block[bits64_pos] |= 1u64 << inner_pos;
             });
-            if pos.is_some() {
-                return pos;
-            }
+            return Some(block_id * BLOCK_BITS + bits64_pos * 64 + inner_pos);
         }
         None
+    }
+    /// Count the allocated bits
+    #[cfg(test)]
+    pub fn allocated(&self, block_device: &Arc<dyn BlockDevice>) -> usize {
+        (0..self.blocks)
+            .map(|i| {
+                get_block_cache(self.start_block_id + i, Arc::clone(block_device))
+                    .lock()
+                    .read(0, |bitmap_block: &BitmapBlock| {
+                        bitmap_block
+                            .iter()
+                            .map(|b| b.count_ones() as usize)
+                            .sum::<usize>()
+                    })
+            })
+            .sum()
     }
     /// Deallocate a block according to the bitmap info
     pub fn dealloc(&self, block_device: &Arc<dyn BlockDevice>, bit: usize) {

@@ -7,13 +7,13 @@ use super::{add_task, SignalFlags};
 use super::{pid_alloc, PidHandle};
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{translated_refmut, MemorySet, KERNEL_SPACE};
-use crate::sync::{Condvar, Mutex, Semaphore, UPSafeCell};
+use crate::sync::{Banker, Condvar, Mutex, Semaphore, UPRefMut, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefMut;
+use easy_fs::Inode;
 
 /// Process Control Block
 pub struct ProcessControlBlock {
@@ -49,6 +49,12 @@ pub struct ProcessControlBlockInner {
     pub semaphore_list: Vec<Option<Arc<Semaphore>>>,
     /// condvar list
     pub condvar_list: Vec<Option<Arc<Condvar>>>,
+    /// deadlock detection switch
+    pub deadlock_detect: bool,
+    /// mutex allocation matrices
+    pub mutex_banker: Banker,
+    /// semaphore allocation matrices
+    pub sem_banker: Banker,
 }
 
 impl ProcessControlBlockInner {
@@ -86,14 +92,22 @@ impl ProcessControlBlockInner {
 
 impl ProcessControlBlock {
     /// inner_exclusive_access
-    pub fn inner_exclusive_access(&self) -> RefMut<'_, ProcessControlBlockInner> {
+    #[track_caller]
+    pub fn inner_exclusive_access(&self) -> UPRefMut<'_, ProcessControlBlockInner> {
         self.inner.exclusive_access()
     }
     /// new process from elf file
-    pub fn new(elf_data: &[u8]) -> Arc<Self> {
+    pub fn new(elf: &Arc<Inode>) -> Arc<Self> {
+        let (process, task) = Self::create(elf);
+        add_task(task);
+        process
+    }
+
+    /// new process from elf file, whose main thread is not yet scheduled
+    fn create(elf: &Arc<Inode>) -> (Arc<Self>, Arc<TaskControlBlock>) {
         trace!("kernel: ProcessControlBlock::new");
         // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf);
         // allocate a pid
         let pid_handle = pid_alloc();
         let process = Arc::new(Self {
@@ -119,6 +133,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_banker: Banker::new(),
+                    sem_banker: Banker::new(),
                 })
             },
         });
@@ -146,18 +163,25 @@ impl ProcessControlBlock {
         process_inner.tasks.push(Some(Arc::clone(&task)));
         drop(process_inner);
         insert_into_pid2process(process.getpid(), Arc::clone(&process));
-        // add main thread to scheduler
+        (process, task)
+    }
+
+    /// Create a child process that runs `elf` directly
+    pub fn spawn(self: &Arc<Self>, elf: &Arc<Inode>) -> Arc<Self> {
+        let (child, task) = Self::create(elf);
+        child.inner_exclusive_access().parent = Some(Arc::downgrade(self));
+        self.inner_exclusive_access().children.push(child.clone());
         add_task(task);
-        process
+        child
     }
 
     /// Only support processes with a single thread.
-    pub fn exec(self: &Arc<Self>, elf_data: &[u8], args: Vec<String>) {
+    pub fn exec(self: &Arc<Self>, elf: &Arc<Inode>, args: Vec<String>) {
         trace!("kernel: exec");
         assert_eq!(self.inner_exclusive_access().thread_count(), 1);
         // memory_set with elf program headers/trampoline/trap context/user stack
         trace!("kernel: exec .. MemorySet::from_elf");
-        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf_data);
+        let (memory_set, ustack_base, entry_point) = MemorySet::from_elf(elf);
         let new_token = memory_set.token();
         // substitute memory_set
         trace!("kernel: exec .. substitute memory_set");
@@ -216,7 +240,7 @@ impl ProcessControlBlock {
         let mut parent = self.inner_exclusive_access();
         assert_eq!(parent.thread_count(), 1);
         // clone parent's memory_set completely including trampoline/ustacks/trap_cxs
-        let memory_set = MemorySet::from_existed_user(&parent.memory_set);
+        let memory_set = MemorySet::from_existed_user(&mut parent.memory_set);
         // alloc a pid
         let pid = pid_alloc();
         // copy fd table
@@ -245,6 +269,9 @@ impl ProcessControlBlock {
                     mutex_list: Vec::new(),
                     semaphore_list: Vec::new(),
                     condvar_list: Vec::new(),
+                    deadlock_detect: false,
+                    mutex_banker: Banker::new(),
+                    sem_banker: Banker::new(),
                 })
             },
         });
@@ -274,8 +301,6 @@ impl ProcessControlBlock {
         trap_cx.kernel_sp = task.kstack.get_top();
         drop(task_inner);
         insert_into_pid2process(child.getpid(), Arc::clone(&child));
-        // add this thread to scheduler
-        add_task(task);
         child
     }
     /// get pid

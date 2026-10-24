@@ -29,8 +29,6 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
             .ustack_base,
         true,
     ));
-    // add new task to scheduler
-    add_task(Arc::clone(&new_task));
     let new_task_inner = new_task.inner_exclusive_access();
     let new_task_res = new_task_inner.res.as_ref().unwrap();
     let new_task_tid = new_task_res.tid;
@@ -41,6 +39,8 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         tasks.push(None);
     }
     tasks[new_task_tid] = Some(Arc::clone(&new_task));
+    process_inner.mutex_banker.reset_thread(new_task_tid);
+    process_inner.sem_banker.reset_thread(new_task_tid);
     let new_task_trap_cx = new_task_inner.get_trap_cx();
     *new_task_trap_cx = TrapContext::app_init_context(
         entry,
@@ -50,6 +50,10 @@ pub fn sys_thread_create(entry: usize, arg: usize) -> isize {
         trap_handler as usize,
     );
     (*new_task_trap_cx).x[10] = arg;
+    drop(new_task_inner);
+    drop(process_inner);
+    // add new task to scheduler
+    add_task(new_task);
     new_task_tid as isize
 }
 /// get current thread id syscall
@@ -93,10 +97,10 @@ pub fn sys_waittid(tid: usize) -> i32 {
     );
     let task = current_task().unwrap();
     let process = task.process.upgrade().unwrap();
-    let task_inner = task.inner_exclusive_access();
+    let self_tid = task.inner_exclusive_access().res.as_ref().unwrap().tid;
     let mut process_inner = process.inner_exclusive_access();
     // a thread cannot wait for itself
-    if task_inner.res.as_ref().unwrap().tid == tid {
+    if self_tid == tid {
         return -1;
     }
     let mut exit_code: Option<i32> = None;

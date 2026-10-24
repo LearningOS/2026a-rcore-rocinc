@@ -3,9 +3,12 @@
 use super::id::TaskUserRes;
 use super::{kstack_alloc, KernelStack, ProcessControlBlock, TaskContext};
 use crate::trap::TrapContext;
-use crate::{mm::PhysPageNum, sync::UPSafeCell};
+use crate::{
+    mm::PhysPageNum,
+    sync::{UPRefMut, UPSafeCell},
+};
 use alloc::sync::{Arc, Weak};
-use core::cell::RefMut;
+use sched::Entity;
 
 /// Task control block structure
 pub struct TaskControlBlock {
@@ -19,7 +22,8 @@ pub struct TaskControlBlock {
 
 impl TaskControlBlock {
     /// Get the mutable reference of the inner TCB
-    pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
+    #[track_caller]
+    pub fn inner_exclusive_access(&self) -> UPRefMut<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
     }
     /// Get the address of app's page table
@@ -41,6 +45,12 @@ pub struct TaskControlBlockInner {
     pub task_status: TaskStatus,
     /// It is set when active exit or execution error occurs
     pub exit_code: Option<i32>,
+    /// Scheduling state, including priority (initially 16) and stride (initially 0)
+    pub sched: Entity,
+    /// The process has exited, so this thread must not run any more
+    pub killed: bool,
+    /// Woken up before it finished blocking
+    pub wakeup_pending: bool,
 }
 
 impl TaskControlBlockInner {
@@ -75,6 +85,9 @@ impl TaskControlBlock {
                     task_cx: TaskContext::goto_trap_return(kstack_top),
                     task_status: TaskStatus::Ready,
                     exit_code: None,
+                    sched: Entity::new(),
+                    killed: false,
+                    wakeup_pending: false,
                 })
             },
         }
@@ -90,4 +103,6 @@ pub enum TaskStatus {
     Running,
     /// blocked
     Blocked,
+    /// exited, waiting to be released
+    Exited,
 }

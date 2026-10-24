@@ -67,8 +67,8 @@ fn clear_bss() {
 }
 
 #[no_mangle]
-/// the rust entry-point of os
-pub fn rust_main() -> ! {
+/// the rust entry-point of os on the boot hart, which starts the others at last
+pub fn rust_main(hartid: usize) -> ! {
     clear_bss();
     println!("[kernel] Hello, world!");
     logging::init();
@@ -79,6 +79,25 @@ pub fn rust_main() -> ! {
     timer::set_next_trigger();
     fs::list_apps();
     task::add_initproc();
+    extern "C" {
+        fn _start_secondary();
+    }
+    let harts = 1
+        + (0..config::MAX_HARTS)
+            .filter(|&id| id != hartid && sbi::hart_start(id, _start_secondary as usize))
+            .count();
+    println!("[kernel] {} hart(s) running", harts);
     task::run_tasks();
     panic!("Unreachable in rust_main!");
+}
+
+#[no_mangle]
+/// the rust entry-point of other harts
+pub fn rust_main_secondary() -> ! {
+    mm::activate_kernel_space();
+    trap::init();
+    trap::enable_timer_interrupt();
+    timer::set_next_trigger();
+    task::run_tasks();
+    panic!("Unreachable in rust_main_secondary!");
 }

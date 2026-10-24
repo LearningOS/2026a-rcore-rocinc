@@ -17,17 +17,21 @@
 #![no_std]
 
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 pub mod bitmap;
 pub mod block_cache;
 pub mod block_dev;
 pub mod efs;
 pub mod layout;
+#[cfg(test)]
+mod tests;
 pub mod vfs;
 
 pub const BLOCK_SZ: usize = 512;
 use bitmap::Bitmap;
-use block_cache::{block_cache_sync_all, get_block_cache};
+use block_cache::{block_cache_sync_all, dirty_block_caches, get_block_cache};
 pub use block_dev::BlockDevice;
 pub use efs::EasyFileSystem;
 pub use layout::*;

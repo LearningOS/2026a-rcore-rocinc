@@ -8,13 +8,21 @@ use bitflags::*;
 bitflags! {
     /// page table entry flags
     pub struct PTEFlags: u8 {
+        /// valid
         const V = 1 << 0;
+        /// readable
         const R = 1 << 1;
+        /// writable
         const W = 1 << 2;
+        /// executable
         const X = 1 << 3;
+        /// accessible in U mode
         const U = 1 << 4;
+        /// global
         const G = 1 << 5;
+        /// accessed
         const A = 1 << 6;
+        /// dirty
         const D = 1 << 7;
     }
 }
@@ -136,6 +144,12 @@ impl PageTable {
         let pte = self.find_pte(vpn).unwrap();
         assert!(pte.is_valid(), "vpn {:?} is invalid before unmapping", vpn);
         *pte = PageTableEntry::empty();
+    }
+    /// replace the valid entry of `vpn`
+    pub fn remap(&mut self, vpn: VirtPageNum, ppn: PhysPageNum, flags: PTEFlags) {
+        let pte = self.find_pte(vpn).unwrap();
+        assert!(pte.is_valid(), "vpn {:?} is invalid before remapping", vpn);
+        *pte = PageTableEntry::new(ppn, flags | PTEFlags::V);
     }
     /// get the page table entry from the virtual page number
     pub fn translate(&self, vpn: VirtPageNum) -> Option<PageTableEntry> {

@@ -1,5 +1,6 @@
 //! SBI console driver, for text output
 use crate::sbi::console_putchar;
+use crate::sync::UPSafeCell;
 use core::fmt::{self, Write};
 
 struct Stdout;
@@ -13,9 +14,22 @@ impl Write for Stdout {
         Ok(())
     }
 }
+
+/// keeps the output of different harts from interleaving
+static STDOUT: UPSafeCell<Stdout> = unsafe { UPSafeCell::new(Stdout) };
+
 /// print to the host console using the format string and arguments.
 pub fn print(args: fmt::Arguments) {
-    Stdout.write_fmt(args).unwrap();
+    STDOUT.exclusive_access().write_fmt(args).unwrap();
+}
+
+/// print for the panic handler, which may be called inside `print`
+pub fn print_in_panic(args: fmt::Arguments) {
+    if STDOUT.accessed_here() {
+        Stdout.write_fmt(args).unwrap();
+    } else {
+        print(args);
+    }
 }
 
 /// Print! macro to the host console using the format string and arguments.
