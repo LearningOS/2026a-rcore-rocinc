@@ -4,12 +4,13 @@ use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
 use crate::config::TRAP_CONTEXT_BASE;
 use crate::fs::{File, Stdin, Stdout};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
-use crate::sync::UPSafeCell;
+use crate::sync::{UPRefMut, UPSafeCell};
 use crate::trap::{trap_handler, TrapContext};
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefMut;
+use easy_fs::Inode;
+use sched::Entity;
 
 /// Task control block structure
 ///
@@ -28,7 +29,8 @@ pub struct TaskControlBlock {
 
 impl TaskControlBlock {
     /// Get the mutable reference of the inner TCB
-    pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
+    #[track_caller]
+    pub fn inner_exclusive_access(&self) -> UPRefMut<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
     }
     /// Get the address of app's page table
@@ -71,6 +73,9 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Scheduling state, including priority (initially 16) and stride (initially 0)
+    pub sched: Entity,
 }
 
 impl TaskControlBlockInner {
@@ -100,9 +105,9 @@ impl TaskControlBlock {
     /// Create a new process
     ///
     /// At present, it is only used for the creation of initproc
-    pub fn new(elf_data: &[u8]) -> Self {
+    pub fn new(elf: &Arc<Inode>) -> Self {
         // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf);
         let trap_cx_ppn = memory_set
             .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
             .unwrap()
@@ -135,6 +140,7 @@ impl TaskControlBlock {
                     ],
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    sched: Entity::new(),
                 })
             },
         };
@@ -151,9 +157,9 @@ impl TaskControlBlock {
     }
 
     /// Load a new elf to replace the original application address space and start execution
-    pub fn exec(&self, elf_data: &[u8]) {
+    pub fn exec(&self, elf: &Arc<Inode>) {
         // memory_set with elf program headers/trampoline/trap context/user stack
-        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
+        let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf);
         let trap_cx_ppn = memory_set
             .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
             .unwrap()
@@ -182,7 +188,7 @@ impl TaskControlBlock {
         // ---- hold parent PCB lock
         let mut parent_inner = self.inner_exclusive_access();
         // copy user space(include trap context)
-        let memory_set = MemorySet::from_existed_user(&parent_inner.memory_set);
+        let memory_set = MemorySet::from_existed_user(&mut parent_inner.memory_set);
         let trap_cx_ppn = memory_set
             .translate(VirtAddr::from(TRAP_CONTEXT_BASE).into())
             .unwrap()
@@ -216,6 +222,7 @@ impl TaskControlBlock {
                     fd_table: new_fd_table,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    sched: Entity::new(),
                 })
             },
         });
@@ -229,6 +236,14 @@ impl TaskControlBlock {
         task_control_block
         // **** release child PCB
         // ---- release parent PCB
+    }
+
+    /// Create a child process that runs `elf` directly
+    pub fn spawn(self: &Arc<Self>, elf: &Arc<Inode>) -> Arc<Self> {
+        let child = Arc::new(Self::new(elf));
+        child.inner_exclusive_access().parent = Some(Arc::downgrade(self));
+        self.inner_exclusive_access().children.push(child.clone());
+        child
     }
 
     /// get pid of process

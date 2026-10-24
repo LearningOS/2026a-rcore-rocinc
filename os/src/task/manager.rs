@@ -1,29 +1,45 @@
 //!Implementation of [`TaskManager`]
 use super::TaskControlBlock;
 use crate::sync::UPSafeCell;
-use alloc::collections::VecDeque;
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use lazy_static::*;
-///A array of `TaskControlBlock` that is thread-safe
+use sched::Scheduler;
+
+/// Scheduler chosen at build time by `SCHED`, stride by default
+const SCHED: &str = match option_env!("SCHED") {
+    Some(name) => name,
+    None => "stride",
+};
+
+///A ready queue of `TaskControlBlock` shared by all harts
 pub struct TaskManager {
-    ready_queue: VecDeque<Arc<TaskControlBlock>>,
+    scheduler: Box<dyn Scheduler<Arc<TaskControlBlock>> + Send>,
 }
 
-/// A simple FIFO scheduler.
 impl TaskManager {
     ///Creat an empty TaskManager
     pub fn new() -> Self {
         Self {
-            ready_queue: VecDeque::new(),
+            scheduler: sched::by_name(SCHED).expect("unknown SCHED"),
         }
     }
     /// Add process back to ready queue
     pub fn add(&mut self, task: Arc<TaskControlBlock>) {
-        self.ready_queue.push_back(task);
+        let mut inner = task.inner_exclusive_access();
+        self.scheduler.push(task.clone(), &mut inner.sched);
     }
     /// Take a process out of the ready queue
     pub fn fetch(&mut self) -> Option<Arc<TaskControlBlock>> {
-        self.ready_queue.pop_front()
+        let task = self.scheduler.pop()?;
+        self.scheduler
+            .pick(&mut task.inner_exclusive_access().sched);
+        Some(task)
+    }
+    /// A timer interrupt hit the running `task`
+    pub fn tick(&mut self, task: &TaskControlBlock) {
+        self.scheduler
+            .tick(&mut task.inner_exclusive_access().sched);
     }
 }
 
@@ -35,12 +51,15 @@ lazy_static! {
 
 /// Add process to ready queue
 pub fn add_task(task: Arc<TaskControlBlock>) {
-    //trace!("kernel: TaskManager::add_task");
     TASK_MANAGER.exclusive_access().add(task);
 }
 
 /// Take a process out of the ready queue
 pub fn fetch_task() -> Option<Arc<TaskControlBlock>> {
-    //trace!("kernel: TaskManager::fetch_task");
     TASK_MANAGER.exclusive_access().fetch()
+}
+
+/// Update the scheduling state of the running `task` on a timer interrupt
+pub fn tick_task(task: &TaskControlBlock) {
+    TASK_MANAGER.exclusive_access().tick(task);
 }

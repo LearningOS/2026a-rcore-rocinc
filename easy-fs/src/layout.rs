@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::fmt::{Debug, Formatter, Result};
 
 /// Magic number for sanity check
-const EFS_MAGIC: u32 = 0x3b800001;
+const EFS_MAGIC: u32 = 0x3b800002;
 /// The max number of direct inodes
 const INODE_DIRECT_COUNT: usize = 28;
 /// The max length of inode name
@@ -259,7 +259,7 @@ impl DiskInode {
         // indirect1
         get_block_cache(self.indirect1 as usize, Arc::clone(block_device))
             .lock()
-            .modify(0, |indirect1: &mut IndirectBlock| {
+            .read(0, |indirect1: &IndirectBlock| {
                 while current_blocks < data_blocks.min(INODE_INDIRECT1_COUNT) {
                     v.push(indirect1[current_blocks]);
                     //indirect1[current_blocks] = 0;
@@ -280,13 +280,13 @@ impl DiskInode {
         let b1 = data_blocks % INODE_INDIRECT1_COUNT;
         get_block_cache(self.indirect2 as usize, Arc::clone(block_device))
             .lock()
-            .modify(0, |indirect2: &mut IndirectBlock| {
+            .read(0, |indirect2: &IndirectBlock| {
                 // full indirect1 blocks
-                for entry in indirect2.iter_mut().take(a1) {
+                for entry in indirect2.iter().take(a1) {
                     v.push(*entry);
                     get_block_cache(*entry as usize, Arc::clone(block_device))
                         .lock()
-                        .modify(0, |indirect1: &mut IndirectBlock| {
+                        .read(0, |indirect1: &IndirectBlock| {
                             for entry in indirect1.iter() {
                                 v.push(*entry);
                             }
@@ -297,7 +297,7 @@ impl DiskInode {
                     v.push(indirect2[a1]);
                     get_block_cache(indirect2[a1] as usize, Arc::clone(block_device))
                         .lock()
-                        .modify(0, |indirect1: &mut IndirectBlock| {
+                        .read(0, |indirect1: &IndirectBlock| {
                             for entry in indirect1.iter().take(b1) {
                                 v.push(*entry);
                             }

@@ -1,6 +1,7 @@
 //! File and filesystem-related syscalls
-use crate::fs::{open_file, OpenFlags, Stat};
-use crate::mm::{translated_byte_buffer, translated_str, UserBuffer};
+use super::{copy_to_user, prepare_user, user_str};
+use crate::fs::{open_file, OpenFlags, Stat, ROOT_INODE};
+use crate::mm::{translated_byte_buffer, UserBuffer};
 use crate::task::{current_task, current_user_token};
 
 pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
@@ -18,6 +19,7 @@ pub fn sys_write(fd: usize, buf: *const u8, len: usize) -> isize {
         let file = file.clone();
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
+        prepare_user(buf as usize, len, false);
         file.write(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize
     } else {
         -1
@@ -40,6 +42,7 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
         // release current task TCB manually to avoid multi-borrow
         drop(inner);
         trace!("kernel: sys_read .. file.read");
+        prepare_user(buf as usize, len, true);
         file.read(UserBuffer::new(translated_byte_buffer(token, buf, len))) as isize
     } else {
         -1
@@ -49,8 +52,7 @@ pub fn sys_read(fd: usize, buf: *const u8, len: usize) -> isize {
 pub fn sys_open(path: *const u8, flags: u32) -> isize {
     trace!("kernel:pid[{}] sys_open", current_task().unwrap().pid.0);
     let task = current_task().unwrap();
-    let token = current_user_token();
-    let path = translated_str(token, path);
+    let path = user_str(path);
     if let Some(inode) = open_file(path.as_str(), OpenFlags::from_bits(flags).unwrap()) {
         let mut inner = task.inner_exclusive_access();
         let fd = inner.alloc_fd();
@@ -75,29 +77,39 @@ pub fn sys_close(fd: usize) -> isize {
     0
 }
 
-/// YOUR JOB: Implement fstat.
-pub fn sys_fstat(_fd: usize, _st: *mut Stat) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_fstat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// get the stat of the file at `fd`
+pub fn sys_fstat(fd: usize, st: *mut Stat) -> isize {
+    trace!("kernel:pid[{}] sys_fstat", current_task().unwrap().pid.0);
+    let task = current_task().unwrap();
+    let inner = task.inner_exclusive_access();
+    let Some(Some(file)) = inner.fd_table.get(fd) else {
+        return -1;
+    };
+    let Some(stat) = file.stat() else {
+        return -1;
+    };
+    drop(inner);
+    copy_to_user(st, &stat);
+    0
 }
 
-/// YOUR JOB: Implement linkat.
-pub fn sys_linkat(_old_name: *const u8, _new_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_linkat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// create a hard link `new_name` to the file `old_name`
+pub fn sys_linkat(old_name: *const u8, new_name: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_linkat", current_task().unwrap().pid.0);
+    let (old_name, new_name) = (user_str(old_name), user_str(new_name));
+    if ROOT_INODE.link(&old_name, &new_name) {
+        0
+    } else {
+        -1
+    }
 }
 
-/// YOUR JOB: Implement unlinkat.
-pub fn sys_unlinkat(_name: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_unlinkat NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+/// remove the hard link `name`
+pub fn sys_unlinkat(name: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_unlinkat", current_task().unwrap().pid.0);
+    if ROOT_INODE.unlink(&user_str(name)) {
+        0
+    } else {
+        -1
+    }
 }

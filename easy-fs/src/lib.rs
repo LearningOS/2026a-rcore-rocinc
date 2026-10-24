@@ -2,16 +2,20 @@
 #![no_std]
 #![deny(missing_docs)]
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 mod bitmap;
 mod block_cache;
 mod block_dev;
 mod efs;
 mod layout;
+#[cfg(test)]
+mod tests;
 mod vfs;
 /// Use a block size of 512 bytes
 pub const BLOCK_SZ: usize = 512;
 use bitmap::Bitmap;
-use block_cache::{block_cache_sync_all, get_block_cache};
+use block_cache::{block_cache_sync_all, dirty_block_caches, get_block_cache};
 pub use block_dev::BlockDevice;
 pub use efs::EasyFileSystem;
 use layout::*;

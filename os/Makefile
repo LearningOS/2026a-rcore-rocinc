@@ -29,6 +29,9 @@ CHAPTER ?= $(shell git rev-parse --abbrev-ref HEAD | sed -E 's/ch([0-9])/\1/')
 TEST ?= $(CHAPTER)
 BASE ?= 1
 
+# Number of harts
+SMP ?= 1
+
 # Disassembly
 DISASM ?= -x
 
@@ -74,6 +77,7 @@ run: build run-inner
 run-inner:
 	@qemu-system-riscv64 \
 		-machine virt \
+		-smp $(SMP) \
 		-nographic \
 		-bios $(BOOTLOADER) \
 		-device loader,file=$(KERNEL_BIN),addr=$(KERNEL_ENTRY_PA) \

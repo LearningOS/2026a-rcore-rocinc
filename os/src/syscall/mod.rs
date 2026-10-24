@@ -56,6 +56,42 @@ use fs::*;
 use process::*;
 
 use crate::fs::Stat;
+use crate::mm::translated_byte_buffer;
+use crate::task::{current_task, current_user_token};
+use alloc::string::String;
+
+/// Read a string from the current user space
+fn user_str(ptr: *const u8) -> String {
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .memory_set
+        .read_str(ptr)
+}
+
+/// Load the pages of [ptr, ptr + len) in the current user space,
+/// and resolve copy-on-write if the kernel is to write there
+fn prepare_user(ptr: usize, len: usize, write: bool) {
+    let task = current_task().unwrap();
+    let memory_set = &mut task.inner_exclusive_access().memory_set;
+    if write {
+        memory_set.prepare_write(ptr.into(), (ptr + len).into());
+    } else {
+        memory_set.prepare_read(ptr.into(), (ptr + len).into());
+    }
+}
+
+/// Copy `value` to `ptr` in the current user space, where it may cross a page boundary
+fn copy_to_user<T>(ptr: *mut T, value: &T) {
+    let len = core::mem::size_of::<T>();
+    let src = unsafe { core::slice::from_raw_parts(value as *const T as *const u8, len) };
+    prepare_user(ptr as usize, len, true);
+    let mut offset = 0;
+    for buf in translated_byte_buffer(current_user_token(), ptr as *const u8, len) {
+        buf.copy_from_slice(&src[offset..offset + buf.len()]);
+        offset += buf.len();
+    }
+}
 
 /// handle syscall exception with `syscall_id` and other arguments
 pub fn syscall(syscall_id: usize, args: [usize; 4]) -> isize {
